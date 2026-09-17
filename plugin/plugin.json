@@ -1,0 +1,10 @@
+{
+  "id": "hermesMonitor",
+  "name": "Hermes Monitor",
+  "description": "Hermes 状态监控:模型余额、通道余额预览、今日用量、Clash 流量",
+  "version": "1.0.0",
+  "author": "LeGuandao",
+  "icon": "bolt",
+  "type": "widget",
+  "component": "./HermesWidget.qml"
+}

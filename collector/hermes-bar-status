@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""hermes-bar-status — DMS 状态栏采集器,输出单行 JSON 供 HermesMonitor 插件读取.
+
+数据源:
+  - 模型/通道: ~/.hermes/config.yaml
+  - DeepSeek 余额: api.deepseek.com/user/balance (免费接口; 缓存 3 分钟, 提问答完即刷新)
+  - 今日用量: ~/.hermes/state.db (messages + session_model_usage, 实时)
+  - 网络速率: /proc/net/dev 差值
+  - 磁盘: shutil.disk_usage("/")
+  - 待更新包: checkupdates (缓存 3 小时)
+  - kanban 任务: ~/.hermes/kanban.db (只读)
+  - FlClash: 7890 存活 + (如开启外部控制则)当前节点
+"""
+import json
+import pathlib
+import re
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+
+HOME = pathlib.Path.home()
+CACHE_DIR = HOME / ".cache" / "hermes-bar"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+DS_TTL = 180          # 余额接口缓存秒数(3 分钟; 余额接口免费, 不产生费用)
+HIST_MIN_GAP = 300    # 历史采样最小间隔(秒)
+HIST_KEEP = 2016      # 历史保留条数上限
+FORCE = "--force" in sys.argv  # 强制跳过余额缓存(手动"更新"按钮用)
+
+out = {
+    "model": "", "provider": "", "provider_label": "",
+    "balance": None, "currency": "CNY", "balance_stale": False,
+    "latency_ms": None, "hist": [], "spend24h": None, "days_left": None,
+    "alert": {"level": None, "changed": False},
+    "tasks": {"todo": 0, "running": 0, "done": 0, "failed": 0},
+    "running": [], "proxy_ok": False, "node": None,
+    "net": {"rx_bps": None, "tx_bps": None},
+    "today": None, "disk": None, "updates": None, "sessions": [],
+    "state": "idle",
+    "last_error": "", "ts": int(time.time()),
+}
+
+# ---- 模型/通道 ----
+try:
+    t = (HOME / ".hermes/config.yaml").read_text()
+    m = re.search(r"(?m)^model:\s*\n(.*?)(?=^\S)", t, re.S)
+    blk = m.group(1) if m else t
+    dm = re.search(r"(?m)^\s*default:\s*(\S+)", blk)
+    pv = re.search(r"(?m)^\s*provider:\s*(\S+)", blk)
+    out["model"] = dm.group(1) if dm else "?"
+    out["provider"] = pv.group(1) if pv else "?"
+except Exception as e:
+    out["last_error"] = f"config: {e}"
+
+LABELS = {
+    "deepseek": "DeepSeek", "zai": "GLM·智谱", "openrouter": "OpenRouter",
+    "anthropic": "Claude", "openai": "OpenAI", "custom": "Custom",
+    "kimi-coding": "Kimi", "minimax": "MiniMax", "gemini": "Gemini",
+}
+out["provider_label"] = LABELS.get(out["provider"], out["provider"] or "?")
+
+# ---- 当前对话实际使用的模型(取最近一次真实调用, 而非静态默认值) ----
+# 有调用记录 → 跟随实际模型; 从未有记录(首次部署) → 置空, 前端显示"待使用"
+try:
+    _con = sqlite3.connect(f"file:{HOME}/.hermes/state.db?mode=ro", uri=True)
+    _row = _con.execute(
+        "SELECT model, billing_provider FROM session_model_usage "
+        "WHERE task = '' ORDER BY last_seen DESC LIMIT 1"
+    ).fetchone()
+    if _row and _row[0]:
+        out["model"] = _row[0]
+        if _row[1]:
+            out["provider"] = _row[1]
+            out["provider_label"] = LABELS.get(_row[1], _row[1])
+    else:
+        out["model"] = ""
+    _con.close()
+except Exception as e:
+    out["last_error"] = f"live-model: {e}"
+
+# ---- 代理存活 (FlClash 7890) ----
+try:
+    s = socket.create_connection(("127.0.0.1", 7890), timeout=0.4)
+    s.close()
+    out["proxy_ok"] = True
+except Exception:
+    pass
+
+# ---- FlClash 当前节点(仅当其开启外部控制时) ----
+try:
+    cfg = HOME / ".local/share/com.follow.clash/config.yaml"
+    if cfg.exists():
+        t = cfg.read_text(errors="replace")
+        am = re.search(r'(?m)^external-controller:\s*"?([^"\n]+)"?\s*$', t)
+        addr = am.group(1).strip() if am else ""
+        if addr:
+            sm = re.search(r'(?m)^secret:\s*"?([^"\n]+)"?\s*$', t)
+            sec = sm.group(1).strip() if sm else ""
+            hdr = ["-H", f"Authorization: Bearer {sec}"] if sec else []
+            r = subprocess.run(["curl", "-s", "-m", "3"] + hdr + [f"http://{addr}/proxies"],
+                               capture_output=True, text=True, timeout=6)
+            data = json.loads(r.stdout)
+            pick = None
+            for name, p in (data.get("proxies") or {}).items():
+                if p.get("type") == "Selector" and p.get("now"):
+                    if any(k in name for k in ("选择", "节点", "机场", "PROXY", "GLOBAL", "手动")):
+                        pick = p.get("now")
+                        break
+                    if pick is None:
+                        pick = p.get("now")
+            out["node"] = pick
+except Exception:
+    pass
+
+# ---- 网络速率 (/proc/net/dev 差值) ----
+try:
+    rx = tx = 0
+    for line in (pathlib.Path("/proc/net/dev")).read_text().splitlines()[2:]:
+        iface, _, data = line.partition(":")
+        if iface.strip() == "lo":
+            continue
+        f = data.split()
+        rx += int(f[0])
+        tx += int(f[8])
+    now = time.time()
+    nf = CACHE_DIR / "net.json"
+    prev = None
+    try:
+        prev = json.loads(nf.read_text())
+    except Exception:
+        pass
+    if prev:
+        dt = now - prev.get("ts", 0)
+        if 1 < dt < 600:
+            out["net"]["rx_bps"] = max(0, int((rx - prev.get("rx", rx)) / dt))
+            out["net"]["tx_bps"] = max(0, int((tx - prev.get("tx", tx)) / dt))
+    nf.write_text(json.dumps({"ts": now, "rx": rx, "tx": tx}))
+except Exception:
+    pass
+
+# ---- 网络速率波形历史 (rx/tx 采样, 最多 120 点) ----
+try:
+    if out["net"]["rx_bps"] is not None:
+        nhf = CACHE_DIR / "net-hist.json"
+        try:
+            nh = json.loads(nhf.read_text())
+        except Exception:
+            nh = []
+        nh_t = time.time()
+        if (not nh) or nh_t - nh[-1][0] >= 4:
+            nh.append([int(nh_t), out["net"]["rx_bps"], out["net"]["tx_bps"]])
+            nh = nh[-120:]
+            nhf.write_text(json.dumps(nh))
+        out["net"]["hist"] = [[p[1], p[2]] for p in nh]
+except Exception:
+    pass
+
+# ---- 每进程流量速率 (ss -tinHp 累计字节差分; 无 root 仅可见本用户进程) ----
+out["net"]["procs"] = []
+try:
+    r = subprocess.run(["ss", "-tinHp"], capture_output=True, text=True, timeout=5)
+    conns = {}  # key -> [proc, sent, recv]
+    cur_header = None
+    for line in r.stdout.splitlines():
+        if not line[:1].isspace():
+            cur_header = line
+            continue
+        if cur_header is None or ("bytes_sent:" not in line and "bytes_received:" not in line):
+            continue
+        hs = cur_header.split()
+        try:
+            key = hs[3] + "->" + hs[4]
+        except IndexError:
+            key = cur_header.strip()[:60]
+        mu = re.search(r'users:\(\("([^"]+)"', cur_header)
+        proc = mu.group(1) if mu else "?"
+        ms = re.search(r'bytes_sent:(\d+)', line)
+        mr = re.search(r'bytes_received:(\d+)', line)
+        conns[key] = [proc, int(ms.group(1)) if ms else 0, int(mr.group(1)) if mr else 0]
+    pf = CACHE_DIR / "net-procs.json"
+    prevp = None
+    try:
+        prevp = json.loads(pf.read_text())
+    except Exception:
+        pass
+    now_p = time.time()
+    if prevp and 1 < now_p - prevp.get("ts", 0) < 600:
+        dt = now_p - prevp["ts"]
+        oldc = prevp.get("conns", {})
+        agg = {}
+        for k, (proc, sent, recv) in conns.items():
+            if proc == "?":
+                continue  # 无进程归属: 已关闭的 TIME-WAIT 连接 / 其他用户的进程, 不上榜
+            old = oldc.get(k)
+            if not old or old[0] != proc:
+                continue
+            dr = max(0, (recv - old[2]) / dt)
+            ds = max(0, (sent - old[1]) / dt)
+            a = agg.setdefault(proc, [0.0, 0.0])
+            a[0] += dr
+            a[1] += ds
+        out["net"]["procs"] = sorted(
+            ({"name": n, "rx": int(v[0]), "tx": int(v[1])} for n, v in agg.items()),
+            key=lambda x: x["rx"] + x["tx"], reverse=True)[:5]
+    pf.write_text(json.dumps({"ts": now_p, "conns": conns}))
+except Exception:
+    pass
+
+# ---- 回合结束检测: 取"最新一条完整回复"的 id (assistant + finish=stop + 无工具调用)。
+#      它增大 = 有一次提问刚答完; 用 id 判重, 即使快速追问也不会漏 ----
+turn_done_id = None
+try:
+    con = sqlite3.connect(f"file:{HOME}/.hermes/state.db?mode=ro", uri=True, timeout=2)
+    rowm = con.execute(
+        "SELECT id FROM messages WHERE role = 'assistant' AND finish_reason = 'stop' "
+        "AND (tool_calls IS NULL OR tool_calls IN ('', '[]', 'null')) "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    con.close()
+    if rowm:
+        turn_done_id = rowm[0]
+except Exception:
+    pass
+
+# ---- 余额历史 ----
+hist_file = CACHE_DIR / "balance-history.json"
+hist = []
+try:
+    hist = json.loads(hist_file.read_text())
+except Exception:
+    hist = []
+
+# ---- 通道余额(多模型预设; 未实现 API 的通道显示"不支持") ----
+BALANCE_PRESETS = {
+    "deepseek": {"label": "DeepSeek", "key_env": "DEEPSEEK_API_KEY", "api": "deepseek"},
+    "zai": {"label": "GLM·智谱", "key_env": None, "api": None},
+}
+
+cur_provider = out.get("provider") or ""
+envf = HOME / ".hermes/.env"
+env_txt = envf.read_text() if envf.exists() else ""
+
+def _fetch_deepseek(key):
+    t0 = time.time()
+    r = subprocess.run(
+        ["curl", "-s", "--max-time", "8",
+         "-H", "Authorization: Bearer " + key,
+         "https://api.deepseek.com/user/balance"],
+        capture_output=True, text=True, timeout=12)
+    lat = int((time.time() - t0) * 1000)
+    d = json.loads(r.stdout)
+    bi = (d.get("balance_infos") or [{}])[0]
+    return bi.get("total_balance"), bi.get("currency", "CNY"), lat
+
+ds_balance, ds_currency, ds_lat = None, "CNY", None
+ds_key = ""
+_ds = BALANCE_PRESETS["deepseek"]
+if _ds["key_env"]:
+    mm = re.search(r'(?m)^' + _ds["key_env"] + r'\s*=\s*"?([^"\n#]+)"?', env_txt)
+    if mm:
+        ds_key = mm.group(1).strip()
+
+ds_cache = CACHE_DIR / "ds-balance.json"
+cached = None
+try:
+    cached = json.loads(ds_cache.read_text())
+except Exception:
+    pass
+
+now = time.time()
+turn_tick = bool(
+    turn_done_id is not None and cached and
+    turn_done_id != cached.get("seen_turn_id"))
+if ds_key:
+    if cached and not FORCE and not turn_tick \
+            and now - cached.get("ts", 0) < DS_TTL and cached.get("balance") is not None:
+        ds_balance = cached["balance"]
+        ds_currency = cached.get("currency", "CNY")
+        ds_lat = cached.get("latency_ms")
+    else:
+        try:
+            ds_balance, ds_currency, ds_lat = _fetch_deepseek(ds_key)
+            out["latency_ms"] = ds_lat
+            ds_cache.write_text(json.dumps({
+                "ts": now, "balance": ds_balance,
+                "currency": ds_currency, "latency_ms": ds_lat,
+                "seen_turn_id": turn_done_id}))
+            if ds_balance is not None:
+                v = round(float(ds_balance), 2)
+                if (not hist) or now - hist[-1][0] >= HIST_MIN_GAP \
+                        or abs(float(hist[-1][1]) - v) > 1e-9:
+                    hist.append([int(now), v])
+                    hist = hist[-HIST_KEEP:]
+                    try:
+                        hist_file.write_text(json.dumps(hist))
+                    except Exception:
+                        pass
+        except Exception:
+            out["balance_stale"] = True
+            if cached:
+                ds_balance = cached.get("balance")
+                ds_currency = cached.get("currency", "CNY")
+                ds_lat = cached.get("latency_ms")
+elif cached:
+    ds_balance = cached.get("balance")
+    ds_currency = cached.get("currency", "CNY")
+
+# 每个相关通道一条余额记录(当前通道 + deepseek, 去重)
+_providers = []
+for _p in ([cur_provider] if cur_provider else []) + ["deepseek"]:
+    if _p and _p not in _providers:
+        _providers.append(_p)
+out["balances"] = []
+for _p in _providers:
+    pr = BALANCE_PRESETS.get(_p) or {}
+    _sup = bool(pr.get("api"))
+    _b = ds_balance if (_p == "deepseek" and _sup) else None
+    _c = ds_currency if (_p == "deepseek" and _sup) else "CNY"
+    _e = {
+        "provider": _p,
+        "label": pr.get("label", LABELS.get(_p, _p)),
+        "balance": _b, "currency": _c, "supported": _sup,
+        "hist": [p[1] for p in hist[-192:]] if (_p == "deepseek") else [],
+        "spend24h": None, "days_left": None,
+    }
+    # 该通道的 24h 消耗 + 可用天数(仅 deepseek 有历史可算)
+    if _p == "deepseek":
+        _win = [p for p in hist if p[0] >= now - 86400]
+        if len(_win) >= 2:
+            _spend = 0.0
+            for (_, v1), (_, v2) in zip(_win, _win[1:]):
+                dv = float(v2) - float(v1)
+                if dv < 0:
+                    _spend += -dv
+            _e["spend24h"] = round(_spend, 2)
+            try:
+                if _b is not None and float(_b) > 0 and _spend > 0.005:
+                    _e["days_left"] = round(float(_b) / _spend, 1)
+            except Exception:
+                pass
+    out["balances"].append(_e)
+
+# 主余额字段 = 当前模型通道的余额(无预设/无实现 → supported=False)
+_cur = next((e for e in out["balances"] if e["provider"] == cur_provider), None)
+if _cur:
+    out["balance"] = _cur["balance"]
+    out["currency"] = _cur["currency"]
+    out["balance_supported"] = _cur["supported"]
+    out["spend24h"] = _cur["spend24h"]
+    out["days_left"] = _cur["days_left"]
+else:
+    out["balance"] = None
+    out["balance_supported"] = False
+
+out["hist"] = [p[1] for p in hist[-192:]]
+
+# ---- 余额预警(只在等级升级时触发一次) ----
+try:
+    af = CACHE_DIR / "alert.json"
+    prev_level = None
+    try:
+        prev_level = json.loads(af.read_text()).get("level")
+    except Exception:
+        pass
+    b = out["balance"]
+    level = None
+    if b is not None:
+        bf = float(b)
+        level = "critical" if bf < 0 else ("low" if bf < 5 else "ok")
+    changed = False
+    if level is not None:
+        rank = {"ok": 0, "low": 1, "critical": 2}
+        if prev_level is None:
+            changed = False  # 首轮只建基线, 不打扰
+        elif rank.get(level, 0) > rank.get(prev_level, 0):
+            changed = True
+        af.write_text(json.dumps({"level": level}))
+    out["alert"] = {"level": level, "changed": changed}
+except Exception:
+    pass
+
+# ---- 今日用量 (state.db, 实时) ----
+try:
+    import datetime
+    con = sqlite3.connect(f"file:{HOME}/.hermes/state.db?mode=ro", uri=True, timeout=2)
+    today0 = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    row = con.execute(
+        "SELECT SUM(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens), "
+        "SUM(estimated_cost_usd) FROM session_model_usage WHERE last_seen >= ?", (today0,)).fetchone()
+    tokens = int(row[0] or 0)
+    cost = float(row[1] or 0)
+    n_user = con.execute(
+        "SELECT COUNT(*) FROM messages WHERE timestamp >= ? AND role='user'", (today0,)).fetchone()[0]
+    n_all = con.execute(
+        "SELECT COUNT(*) FROM messages WHERE timestamp >= ?", (today0,)).fetchone()[0]
+    last_ts = con.execute("SELECT MAX(timestamp) FROM messages").fetchone()[0]
+    con.close()
+    out["today"] = {"tokens": tokens, "cost_usd": round(cost, 3),
+                    "user_msgs": n_user, "msgs": n_all, "last_ts": last_ts}
+except Exception as e:
+    out["today"] = None
+
+# ---- 磁盘 ----
+try:
+    u = shutil.disk_usage("/")
+    out["disk"] = {"free_gb": round(u.free / 2**30, 1),
+                   "total_gb": round(u.total / 2**30, 1),
+                   "pct": round(u.used / u.total * 100)}
+except Exception:
+    pass
+
+# ---- 待更新包 (checkupdates, 缓存 3h) ----
+try:
+    uf = CACHE_DIR / "updates.json"
+    uc = None
+    try:
+        uc = json.loads(uf.read_text())
+    except Exception:
+        pass
+    if uc and time.time() - uc.get("ts", 0) < 10800:
+        out["updates"] = {"count": uc.get("count"), "ts": uc.get("ts")}
+    else:
+        try:
+            r = subprocess.run(["checkupdates"], capture_output=True, text=True, timeout=25)
+            if r.returncode in (0, 1, 2):
+                cnt = len([l for l in r.stdout.splitlines() if l.strip()])
+                rec = {"count": cnt, "ts": time.time()}
+                uf.write_text(json.dumps(rec))
+                out["updates"] = rec
+            elif uc:
+                out["updates"] = {"count": uc.get("count"), "ts": uc.get("ts")}
+        except Exception:
+            if uc:
+                out["updates"] = {"count": uc.get("count"), "ts": uc.get("ts")}
+except Exception:
+    pass
+
+# ---- kanban 任务(只读) ----
+try:
+    con = sqlite3.connect(f"file:{HOME}/.hermes/kanban.db?mode=ro", uri=True, timeout=2)
+    for st, n in con.execute("SELECT status, COUNT(*) FROM tasks GROUP BY status"):
+        s = (st or "").lower()
+        if s in ("done", "completed"):
+            out["tasks"]["done"] += n
+        elif s in ("running", "claimed", "in_progress"):
+            out["tasks"]["running"] += n
+        elif s in ("failed", "error"):
+            out["tasks"]["failed"] += n
+        else:
+            out["tasks"]["todo"] += n
+    out["running"] = [r[0] for r in con.execute(
+        "SELECT title FROM tasks WHERE status IN ('running','claimed','in_progress') "
+        "ORDER BY started_at DESC LIMIT 3")]
+    con.close()
+except Exception:
+    pass
+
+# ---- 最近对话 (state.db sessions, 近 24 小时) ----
+try:
+    con = sqlite3.connect(f"file:{HOME}/.hermes/state.db?mode=ro", uri=True, timeout=2)
+    srows = con.execute(
+        "SELECT title, source, last_activity_at, message_count FROM sessions "
+        "WHERE archived = 0 AND hidden = 0 AND last_activity_at >= ? "
+        "ORDER BY last_activity_at DESC LIMIT 4",
+        (time.time() - 86400,)).fetchall()
+    con.close()
+    out["sessions"] = [{
+        "title": r[0] or "(未命名对话)",
+        "src": r[1] or "",
+        "last_ts": r[2],
+        "msgs": r[3] or 0,
+    } for r in srows]
+except Exception:
+    out["sessions"] = None
+
+# ---- 对话状态检测(顶栏 pill 图标用): needs_user / working / done / idle ----
+# needs_user = 等批准/等澄清回答; working = 正在生成/执行; done = 刚答完; idle = 空闲
+try:
+    con = sqlite3.connect(f"file:{HOME}/.hermes/state.db?mode=ro", uri=True, timeout=2)
+    srow = con.execute(
+        "SELECT last_activity_description, last_activity_at FROM sessions "
+        "ORDER BY last_activity_at DESC LIMIT 1").fetchone()
+    mrow = con.execute(
+        "SELECT role, finish_reason, timestamp FROM messages ORDER BY id DESC LIMIT 1").fetchone()
+    con.close()
+    now2 = time.time()
+    desc = ((srow[0] or "") if srow else "").lower()
+    dage = (now2 - (srow[1] or 0)) if srow else 1e9
+    if any(k in desc for k in ("approval", "clarify", "sudo", "secret", "passphrase")) and dage < 600:
+        st = "needs_user"
+    elif desc.strip() and dage < 120:
+        st = "working"
+    elif mrow:
+        role, fin, mts = mrow[0], mrow[1], (mrow[2] or 0)
+        mage = now2 - mts
+        if role == "assistant" and fin == "stop":
+            st = "done"
+        elif role in ("user", "tool") or (role == "assistant" and fin == "tool_calls"):
+            st = "working" if mage < 600 else "idle"
+        else:
+            st = "idle"
+    else:
+        st = "idle"
+    out["state"] = st
+except Exception:
+    pass
+
+print(json.dumps(out, ensure_ascii=False))
